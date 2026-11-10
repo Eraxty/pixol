@@ -1,0 +1,9 @@
+.env
+memory.json
+page.png
+__pycache__/
+.venv/
+.pixol.pid
+pixol.log
+facts.json
+threads.json

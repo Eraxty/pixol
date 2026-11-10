@@ -1,0 +1,263 @@
+"""pixol — a Slack helper bot with its own browser.
+
+Triggers: @pixol mention, the keyword "pixol" in a channel, or any DM.
+"""
+
+import asyncio
+import json
+import re
+import time
+import traceback
+
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_bolt.async_app import AsyncApp
+
+import brain
+import config
+from browser import browser
+
+config.validate()
+
+app = AsyncApp(token=config.SLACK_BOT_TOKEN)
+BOT_ID: str | None = None
+MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+async def clean_text(client, text: str) -> tuple[str, dict[str, str]]:
+    """Drop the bot's own mention; turn other <@U..> into @Name so the model
+    knows who is being talked about. Returns (text, {uid: name})."""
+    people: dict[str, str] = {}
+    for uid in set(MENTION_RE.findall(text)):
+        if uid != BOT_ID:
+            people[uid] = await name_of(client, uid)
+
+    # a leading "@pixol" is just how people summon him; anywhere else it's
+    # part of the sentence ("what on earth is @pixol") so keep it as his name
+    text = re.sub(rf"^\s*<@{BOT_ID}(?:\|[^>]*)?>[\s,:]*", "", text) if BOT_ID else text
+
+    def sub(m):
+        uid = m.group(1)
+        return f"@{config.BOT_NAME}" if uid == BOT_ID else f"@{people.get(uid, uid)}"
+
+    return re.sub(r"\s+", " ", MENTION_RE.sub(sub, text)).strip(), people
+
+
+async def _reaction(client, channel, ts, name, add=True):
+    try:
+        if add:
+            await client.reactions_add(channel=channel, timestamp=ts, name=name)
+        else:
+            await client.reactions_remove(channel=channel, timestamp=ts, name=name)
+    except Exception:
+        pass
+
+
+_names: dict[str, str] = {}
+
+
+async def name_of(client, uid: str) -> str:
+    if uid not in _names:
+        try:
+            u = (await client.users_info(user=uid))["user"]
+            p = u.get("profile", {})
+            _names[uid] = p.get("display_name") or p.get("real_name") or u.get("name") or uid
+        except Exception:
+            _names[uid] = uid
+    return _names[uid]
+
+
+async def recent_context(client, channel: str, ts: str, thread_ts: str | None):
+    """Last few messages around this one, as 'Name: text' lines + {uid: name}."""
+    try:
+        if thread_ts:
+            r = await client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+            msgs = r["messages"]
+        else:
+            r = await client.conversations_history(channel=channel, latest=ts, inclusive=False,
+                                                   limit=config.CONTEXT_MSGS)
+            msgs = list(reversed(r["messages"]))
+    except Exception:
+        return "", {}
+    msgs = [m for m in msgs if m.get("ts") != ts and m.get("text")][-config.CONTEXT_MSGS :]
+    lines, people = [], {}
+    for m in msgs:
+        if m.get("user") == BOT_ID or m.get("bot_id"):
+            who = config.BOT_NAME if m.get("user") == BOT_ID else "some bot"
+        else:
+            who = await name_of(client, m.get("user", "?"))
+            people[m.get("user", "?")] = who
+        body, _ = await clean_text(client, m["text"])
+        body = re.sub(r"<https?://[^>]+>", "[link]", body)
+        lines.append(f"{who}: {body[:300]}")
+    return "\n".join(lines), people
+
+
+_muted_until: dict[str, float] = {}
+SHUSH_RE = re.compile(rf"^\W*(?:@?{re.escape(config.BOT_NAME)}\W*)?(?:shut\s*up|stfu|be\s+quiet|shush|go\s+to\s+sleep|mute)\b", re.I)
+WAKE_RE = re.compile(rf"^\W*(?:@?{re.escape(config.BOT_NAME)}\W*)?(?:wake\s*up|unmute|come\s+back|you\s+can\s+talk)\b", re.I)
+
+
+async def handle(event: dict, client, trigger: str = "mention"):
+    text, mentioned = await clean_text(client, event.get("text", ""))
+    if not text:
+        return
+
+    channel = event["channel"]
+    if WAKE_RE.search(text) and _muted_until.get(channel, 0) > time.monotonic():
+        _muted_until.pop(channel, None)
+        await client.chat_postMessage(channel=channel, thread_ts=event.get("thread_ts") or event["ts"], text="i'm back")
+        return
+    if SHUSH_RE.search(text):
+        _muted_until[channel] = time.monotonic() + config.MUTE_MINUTES * 60
+        log(f"muted in {channel} for {config.MUTE_MINUTES}m")
+        await _reaction(client, channel, event["ts"], "zipper_mouth_face", True)
+        return
+    if _muted_until.get(channel, 0) > time.monotonic():
+        return
+    ts = event["ts"]
+    thread_ts = event.get("thread_ts")
+    thread = thread_ts or ts
+    # top-level chatter shares one memory per channel; threads get their own
+    key = f"{channel}:{thread_ts}" if thread_ts else channel
+
+    uid = event.get("user", "?")
+    eyes = trigger != "followup"
+    if eyes:
+        await _reaction(client, channel, ts, "eyes", True)
+    try:
+        speaker = await name_of(client, uid)
+        recent, people = await recent_context(client, channel, ts, thread_ts)
+        people = {**people, **mentioned}  # facts about mentioned people get loaded too
+        reply = await brain.respond(text, key, uid, speaker, recent, people, trigger)
+    finally:
+        if eyes:
+            await _reaction(client, channel, ts, "eyes", False)
+
+    if reply.text or reply.png:
+        track_thread(channel, thread)
+
+    if reply.png:
+        try:
+            await client.files_upload_v2(
+                channel=channel,
+                thread_ts=thread,
+                file=reply.png,
+                filename=f"{config.BOT_NAME}.png",
+                title=f"{config.BOT_NAME} screenshot",
+                initial_comment=reply.text or None,
+                request_file_info=False,
+            )
+            return
+        except Exception:
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread,
+                text=(reply.text or "") + "\n_(screenshot upload failed)_",
+            )
+            return
+
+    if not reply.text:
+        return  # he decided this one didn't need him
+    await client.chat_postMessage(channel=channel, thread_ts=thread, text=reply.text)
+
+
+def log(msg: str) -> None:
+    print(f"[pixol] {msg}", flush=True)
+
+
+@app.event("app_mention")
+async def on_mention(event, client):
+    log(f"app_mention in {event.get('channel')}")
+    await handle(event, client)
+
+
+_last_keyword: dict[str, float] = {}
+
+# threads pixol has replied in -> last activity (epoch). He keeps listening there
+# so people can follow up without saying his name; the model SKIPs what isn't for him.
+THREADS_FILE = config.BASE_DIR / "threads.json"
+
+
+def _load_threads() -> dict[str, float]:
+    try:
+        return json.loads(THREADS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+_threads: dict[str, float] = _load_threads()
+
+
+def track_thread(channel: str, thread_ts: str):
+    now = time.time()
+    _threads[f"{channel}:{thread_ts}"] = now
+    for k in [k for k, t in _threads.items() if now - t > config.FOLLOWUP_HOURS * 3600]:
+        del _threads[k]
+    THREADS_FILE.write_text(json.dumps(_threads))
+
+
+def in_my_thread(channel: str, thread_ts: str | None) -> bool:
+    t = _threads.get(f"{channel}:{thread_ts}") if thread_ts else None
+    return bool(t) and time.time() - t < config.FOLLOWUP_HOURS * 3600
+
+
+def says_name(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in config.KEYWORDS)
+
+
+@app.event("message")
+async def on_message(event, client):
+    if event.get("bot_id") or event.get("subtype"):
+        return
+    text = event.get("text") or ""
+    if BOT_ID and f"<@{BOT_ID}>" in text:
+        return  # app_mention already owns this one
+    channel = event.get("channel", "")
+    thread_ts = event.get("thread_ts")
+
+    if event.get("channel_type") == "im":
+        trigger = "dm"
+    elif says_name(text):
+        trigger = "name"
+        spot = f"{channel}:{thread_ts or ''}"
+        now = time.monotonic()
+        if now - _last_keyword.get(spot, -1e9) < config.KEYWORD_COOLDOWN:
+            log(f"name in {channel} skipped (cooldown)")
+            return
+        _last_keyword[spot] = now
+    elif in_my_thread(channel, thread_ts):
+        trigger = "followup"
+    else:
+        return
+    log(f"message in {channel} trigger={trigger}")
+    await handle(event, client, trigger)
+
+
+@app.error
+async def on_error(error, body):
+    log(f"error: {error}")
+    print(body, flush=True)
+
+
+async def main():
+    global BOT_ID
+    info = await app.client.auth_test()
+    BOT_ID = info.get("user_id")
+    log(f"logged in as {info.get('user')} ({BOT_ID}) · model {config.LLM_MODEL}")
+    log(f"keywords: {config.KEYWORDS} · listening on Socket Mode")
+
+    handler = AsyncSocketModeHandler(app, config.SLACK_APP_TOKEN)
+    try:
+        await handler.start_async()
+    finally:
+        await browser.stop()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[pixol] bye", flush=True)
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1)
